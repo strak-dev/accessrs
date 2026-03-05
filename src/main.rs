@@ -20,6 +20,8 @@ fn main() -> eframe::Result<()> {
     )
 }
 
+// ── Column / table-creation types ────────────────────────────────────────────
+
 #[derive(Clone)]
 struct ColumnDef {
     name: String,
@@ -60,6 +62,8 @@ impl Default for ColumnDef {
         }
     }
 }
+
+// ── Create-table dialog ───────────────────────────────────────────────────────
 
 struct CreateTableDialog {
     open: bool,
@@ -124,12 +128,27 @@ impl CreateTableDialog {
     }
 }
 
-// Holds a loaded table's data for display
+// ── Cell popover ──────────────────────────────────────────────────────────────
+
+struct CellPopover {
+    open: bool,
+    row_idx: usize,
+    col_idx: usize,
+    buffer: String,
+    pos: egui::Pos2,
+}
+
+// ── Table view (loaded data + edit state) ────────────────────────────────────
+
 struct TableView {
     table_name: String,
     columns: Vec<String>,
     rows: Vec<Vec<String>>,
     error: Option<String>,
+    editing_cell: Option<(usize, usize)>,
+    edit_buffer: String,
+    new_row: Vec<String>,
+    new_row_error: Option<String>,
 }
 
 impl TableView {
@@ -139,9 +158,12 @@ impl TableView {
             columns: vec![],
             rows: vec![],
             error: None,
+            editing_cell: None,
+            edit_buffer: String::new(),
+            new_row: vec![],
+            new_row_error: None,
         };
 
-        // Get column names via PRAGMA
         match conn.prepare(&format!("PRAGMA table_info({})", table_name)) {
             Err(e) => {
                 view.error = Some(format!("Failed to load schema: {e}"));
@@ -149,28 +171,34 @@ impl TableView {
             }
             Ok(mut stmt) => {
                 view.columns = stmt
-                    .query_map([], |row| row.get::<_, String>(1)) // col 1 = name
+                    .query_map([], |row| row.get::<_, String>(1))
                     .unwrap()
                     .filter_map(|r| r.ok())
                     .collect();
             }
         }
 
-        // Load rows — everything as string for display
-        let col_count = view.columns.len();
-        let sql = format!("SELECT * FROM {} LIMIT 1000", table_name);
+        view.new_row = vec![String::new(); view.columns.len()];
+        view.reload_rows(conn);
+        view
+    }
+
+    fn reload_rows(&mut self, conn: &Connection) {
+        self.rows.clear();
+        let col_count = self.columns.len();
+        let sql = format!("SELECT * FROM {} LIMIT 1000", self.table_name);
         match conn.prepare(&sql) {
             Err(e) => {
-                view.error = Some(format!("Failed to query table: {e}"));
+                self.error = Some(format!("Failed to query table: {e}"));
             }
             Ok(mut stmt) => {
-                let rows: Vec<Vec<String>> = stmt
+                self.rows = stmt
                     .query_map([], |row| {
                         let cells = (0..col_count)
                             .map(|i| {
                                 row.get_ref(i)
                                     .map(|v| match v {
-                                        rusqlite::types::ValueRef::Null => "NULL".to_string(),
+                                        rusqlite::types::ValueRef::Null => String::new(),
                                         rusqlite::types::ValueRef::Integer(n) => n.to_string(),
                                         rusqlite::types::ValueRef::Real(f) => f.to_string(),
                                         rusqlite::types::ValueRef::Text(t) => {
@@ -186,13 +214,12 @@ impl TableView {
                     .unwrap()
                     .filter_map(|r| r.ok())
                     .collect();
-                view.rows = rows;
             }
         }
-
-        view
     }
 }
+
+// ── App ───────────────────────────────────────────────────────────────────────
 
 struct App {
     conn: Option<Connection>,
@@ -201,7 +228,9 @@ struct App {
     tables: Vec<String>,
     selected_table: Option<String>,
     create_dialog: CreateTableDialog,
+    cell_popover: Option<CellPopover>,
     table_view: Option<TableView>,
+    row_height: f32,
 }
 
 impl Default for App {
@@ -213,7 +242,9 @@ impl Default for App {
             tables: vec![],
             selected_table: None,
             create_dialog: CreateTableDialog::default(),
+            cell_popover: None,
             table_view: None,
+            row_height: 24.0,
         }
     }
 }
@@ -241,24 +272,20 @@ impl App {
             let mut stmt = conn
                 .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
                 .unwrap();
-            let names: Vec<String> = stmt
+            self.tables = stmt
                 .query_map([], |row| row.get(0))
                 .unwrap()
                 .filter_map(|r| r.ok())
                 .collect();
-            self.tables = names;
         }
     }
 
     fn select_table(&mut self, name: &str) {
         self.selected_table = Some(name.to_string());
         if let Some(conn) = &self.conn {
-            self.table_view = Some(TableView::load(conn, name));
-            self.status = format!(
-                "Table: {} — {} rows",
-                name,
-                self.table_view.as_ref().map(|v| v.rows.len()).unwrap_or(0)
-            );
+            let view = TableView::load(conn, name);
+            self.status = format!("Table: {} — {} rows", name, view.rows.len());
+            self.table_view = Some(view);
         }
     }
 
@@ -285,7 +312,137 @@ impl App {
             }
         }
     }
+
+    fn commit_edit(&mut self) {
+        let (row_idx, col_idx, value, table_name, columns, row_data) = {
+            let view = match &self.table_view {
+                Some(v) => v,
+                None => return,
+            };
+            let (row_idx, col_idx) = match view.editing_cell {
+                Some(c) => c,
+                None => return,
+            };
+            (
+                row_idx,
+                col_idx,
+                view.edit_buffer.clone(),
+                view.table_name.clone(),
+                view.columns.clone(),
+                view.rows[row_idx].clone(),
+            )
+        };
+
+        let where_clause: String = columns
+            .iter()
+            .enumerate()
+            .map(|(i, col)| format!("{} = ?{}", col, i + 1))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+
+        let sql = format!(
+            "UPDATE {} SET {} = ?{} WHERE {}",
+            table_name,
+            columns[col_idx],
+            columns.len() + 1,
+            where_clause,
+        );
+
+        let mut params: Vec<String> = row_data.clone();
+        params.push(value.clone());
+
+        let result = self
+            .conn
+            .as_ref()
+            .unwrap()
+            .execute(&sql, rusqlite::params_from_iter(params.iter()));
+
+        match result {
+            Ok(_) => {
+                if let Some(view) = &mut self.table_view {
+                    view.rows[row_idx][col_idx] = value;
+                    view.editing_cell = None;
+                    view.edit_buffer.clear();
+                }
+                self.status = "Row updated.".to_string();
+            }
+            Err(e) => {
+                self.status = format!("Update failed: {e}");
+                if let Some(view) = &mut self.table_view {
+                    view.editing_cell = None;
+                }
+            }
+        }
+    }
+
+    fn commit_insert(&mut self) {
+        let (table_name, columns, new_row) = {
+            let view = match &self.table_view {
+                Some(v) => v,
+                None => return,
+            };
+            (
+                view.table_name.clone(),
+                view.columns.clone(),
+                view.new_row.clone(),
+            )
+        };
+
+        let (cols, vals): (Vec<&str>, Vec<&str>) = columns
+            .iter()
+            .zip(new_row.iter())
+            .filter(|(_, v)| !v.trim().is_empty())
+            .map(|(c, v)| (c.as_str(), v.as_str()))
+            .unzip();
+
+        if cols.is_empty() {
+            if let Some(view) = &mut self.table_view {
+                view.new_row_error = Some("Enter at least one value.".to_string());
+            }
+            return;
+        }
+
+        let placeholders = (1..=cols.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let sql = format!(
+            "INSERT INTO {} ({}) VALUES ({})",
+            table_name,
+            cols.join(", "),
+            placeholders,
+        );
+
+        let result = self
+            .conn
+            .as_ref()
+            .unwrap()
+            .execute(&sql, rusqlite::params_from_iter(vals.iter()));
+
+        match result {
+            Ok(_) => {
+                self.status = "Row inserted.".to_string();
+                if let Some(view) = &mut self.table_view {
+                    view.new_row = vec![String::new(); view.columns.len()];
+                    view.new_row_error = None;
+                }
+                if let Some(conn) = &self.conn {
+                    if let Some(view) = &mut self.table_view {
+                        view.reload_rows(conn);
+                    }
+                }
+            }
+            Err(e) => {
+                if let Some(view) = &mut self.table_view {
+                    view.new_row_error = Some(format!("Insert failed: {e}"));
+                }
+            }
+        }
+    }
 }
+
+// ── UI ────────────────────────────────────────────────────────────────────────
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -330,9 +487,7 @@ impl eframe::App for App {
 
         // Status bar
         egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(&self.status);
-            });
+            ui.label(&self.status);
         });
 
         // Create table modal
@@ -346,10 +501,8 @@ impl eframe::App for App {
                         ui.label("Table name:");
                         ui.text_edit_singleline(&mut self.create_dialog.table_name);
                     });
-
                     ui.add_space(8.0);
                     ui.separator();
-
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new("Column Name").strong());
                         ui.add_space(80.0);
@@ -360,11 +513,12 @@ impl eframe::App for App {
                         ui.label(egui::RichText::new("Not Null").strong());
                     });
                     ui.separator();
-
                     let mut to_delete: Option<usize> = None;
                     for (i, col) in self.create_dialog.columns.iter_mut().enumerate() {
                         ui.horizontal(|ui| {
-                            ui.add(egui::TextEdit::singleline(&mut col.name).desired_width(140.0));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut col.name).desired_width(140.0),
+                            );
                             egui::ComboBox::from_id_salt(format!("col_type_{i}"))
                                 .selected_text(col.col_type.label())
                                 .width(90.0)
@@ -389,22 +543,18 @@ impl eframe::App for App {
                     if let Some(i) = to_delete {
                         self.create_dialog.columns.remove(i);
                     }
-
                     ui.add_space(4.0);
                     if ui.button("+ Add column").clicked() {
                         self.create_dialog.columns.push(ColumnDef::default());
                     }
-
                     ui.add_space(8.0);
                     ui.separator();
-
                     if let Ok(sql) = self.create_dialog.to_sql() {
                         ui.label(egui::RichText::new(&sql).monospace().weak());
                     }
-                    if let Some(err) = &self.create_dialog.error.clone() {
+                    if let Some(err) = self.create_dialog.error.clone() {
                         ui.colored_label(egui::Color32::RED, err);
                     }
-
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         if ui.button("Create").clicked() {
@@ -417,7 +567,64 @@ impl eframe::App for App {
                 });
         }
 
-        // Left sidebar
+        // ── Cell popover editor ───────────────────────────────────────────────
+        // Rendered at the top level so it floats over the table cleanly.
+        let mut popover_commit = false;
+        let mut popover_cancel = false;
+
+        if let Some(popover) = &mut self.cell_popover {
+            let mut win_open = popover.open;
+            egui::Window::new("Edit Cell")
+                .open(&mut win_open)
+                .fixed_pos(popover.pos)
+                .fixed_size([320.0, 160.0])
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.add(
+                        egui::TextEdit::multiline(&mut popover.buffer)
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(5),
+                    );
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.button("Save").clicked() {
+                            popover_commit = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            popover_cancel = true;
+                        }
+                        ui.weak("Ctrl+Enter to save  •  Esc to cancel");
+                    });
+                    if ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Enter)) {
+                        popover_commit = true;
+                    }
+                    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        popover_cancel = true;
+                    }
+                });
+            // user clicked the window's X button
+            if !win_open {
+                popover_cancel = true;
+            }
+        }
+
+        if popover_commit {
+            // Inject into table_view edit state then reuse commit_edit()
+            if let Some(popover) = &self.cell_popover {
+                if let Some(view) = &mut self.table_view {
+                    view.editing_cell = Some((popover.row_idx, popover.col_idx));
+                    view.edit_buffer = popover.buffer.clone();
+                }
+            }
+            self.commit_edit();
+            self.cell_popover = None;
+        }
+        if popover_cancel {
+            self.cell_popover = None;
+        }
+
+        // Sidebar
         if self.conn.is_some() {
             egui::SidePanel::left("table_list")
                 .resizable(true)
@@ -435,12 +642,10 @@ impl eframe::App for App {
                         });
                     });
                     ui.separator();
-
                     if self.tables.is_empty() {
                         ui.label("No tables yet.");
                     } else {
                         egui::ScrollArea::vertical().show(ui, |ui| {
-                            // collect first to avoid borrow conflict
                             let tables = self.tables.clone();
                             for table in &tables {
                                 let selected =
@@ -483,66 +688,230 @@ impl eframe::App for App {
                 return;
             }
 
-            match &self.selected_table {
-                None => {
-                    ui.centered_and_justified(|ui| {
-                        ui.label("Select a table from the sidebar.");
-                    });
-                }
-                Some(_) => {
-                    // Clone out what we need so we don't hold a borrow into self
-                    let (table_name, columns, rows, error) = match &self.table_view {
-                        None => return,
-                        Some(view) => (
-                            view.table_name.clone(),
-                            view.columns.clone(),
-                            view.rows.clone(),
-                            view.error.clone(),
-                        ),
-                    };
+            if self.selected_table.is_none() {
+                ui.centered_and_justified(|ui| {
+                    ui.label("Select a table from the sidebar.");
+                });
+                return;
+            }
 
-                    if let Some(err) = &error {
-                        ui.colored_label(egui::Color32::RED, err);
-                        return;
+            // Clone everything needed before any mutable borrows
+            let (table_name, columns, rows, error, editing_cell, new_row, new_row_error) =
+                match &self.table_view {
+                    None => return,
+                    Some(v) => (
+                        v.table_name.clone(),
+                        v.columns.clone(),
+                        v.rows.clone(),
+                        v.error.clone(),
+                        v.editing_cell,
+                        v.new_row.clone(),
+                        v.new_row_error.clone(),
+                    ),
+                };
+
+            if let Some(err) = error {
+                ui.colored_label(egui::Color32::RED, err);
+                return;
+            }
+
+            // Toolbar
+            ui.horizontal(|ui| {
+                ui.heading(&table_name);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("⟳ Refresh").clicked() {
+                        if let Some(conn) = &self.conn {
+                            if let Some(view) = &mut self.table_view {
+                                view.reload_rows(conn);
+                            }
+                        }
                     }
+                    ui.separator();
+                    ui.label("Row height:");
+                    ui.add(egui::Slider::new(&mut self.row_height, 20.0..=80.0).step_by(4.0));
+                });
+            });
+            ui.separator();
 
-                    ui.horizontal(|ui| {
-                        ui.heading(&table_name);
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("⟳ Refresh").clicked() {
-                                if let Some(conn) = &self.conn {
-                                    self.table_view = Some(TableView::load(conn, &table_name));
+            // Deferred action flags — collected during table render, applied after
+            let mut do_commit_edit = false;
+            let mut do_cancel_edit = false;
+            let mut new_editing_cell: Option<Option<(usize, usize)>> = None;
+            let mut new_edit_buffer: Option<String> = None;
+            let mut do_commit_insert = false;
+            let mut new_row_updates: Vec<(usize, String)> = vec![];
+            let mut new_popover: Option<CellPopover> = None; // ← declared here
+
+            egui::ScrollArea::both().show(ui, |ui| {
+                TableBuilder::new(ui)
+                    .striped(true)
+                    .resizable(true)
+                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                    .column(Column::exact(36.0))
+                    .columns(Column::auto().resizable(true).clip(true), columns.len())
+                    .header(24.0, |mut header| {
+                        header.col(|ui| {
+                            ui.weak("#");
+                        });
+                        for col_name in &columns {
+                            header.col(|ui| {
+                                ui.strong(col_name);
+                            });
+                        }
+                    })
+                    .body(|body| {
+                        let total_rows = rows.len() + 1;
+                        body.rows(self.row_height, total_rows, |mut row| {
+                            let row_idx = row.index();
+
+                            // ── New-row insert strip ──────────────────────
+                            if row_idx == rows.len() {
+                                row.col(|ui| {
+                                    ui.weak("*");
+                                });
+                                for (col_idx, val) in new_row.iter().enumerate() {
+                                    row.col(|ui| {
+                                        let mut buf = val.clone();
+                                        let response = ui.add(
+                                            egui::TextEdit::singleline(&mut buf)
+                                                .desired_width(f32::INFINITY)
+                                                .hint_text("…"),
+                                        );
+                                        if buf != *val {
+                                            new_row_updates.push((col_idx, buf));
+                                        }
+                                        if response.lost_focus()
+                                            && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                                        {
+                                            do_commit_insert = true;
+                                        }
+                                    });
                                 }
+                                return;
+                            }
+
+                            // ── Existing rows ─────────────────────────────
+                            row.col(|ui| {
+                                ui.weak((row_idx + 1).to_string());
+                            });
+
+                            for (col_idx, cell) in rows[row_idx].iter().enumerate() {
+                                row.col(|ui| {
+                                    let is_editing = editing_cell == Some((row_idx, col_idx));
+
+                                    if is_editing {
+                                        let mut buf = match &new_edit_buffer {
+                                            Some(b) => b.clone(),
+                                            None => {
+                                                if let Some(view) = self.table_view.as_ref() {
+                                                    view.edit_buffer.clone()
+                                                } else {
+                                                    cell.clone()
+                                                }
+                                            }
+                                        };
+
+                                        let response = ui.add(
+                                            egui::TextEdit::singleline(&mut buf)
+                                                .desired_width(f32::INFINITY),
+                                        );
+                                        response.request_focus();
+                                        new_edit_buffer = Some(buf);
+
+                                        let enter =
+                                            ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                        let escape =
+                                            ui.input(|i| i.key_pressed(egui::Key::Escape));
+
+                                        if enter {
+                                            do_commit_edit = true;
+                                        } else if escape {
+                                            do_cancel_edit = true;
+                                        } else if response.lost_focus() {
+                                            do_commit_edit = true;
+                                        }
+                                    } else {
+                                        // ── Display cell ──────────────────
+                                        let is_long = cell.len() > 60;
+                                        let display = if is_long {
+                                            format!("{}…", &cell[..60])
+                                        } else {
+                                            cell.clone()
+                                        };
+
+                                        let response = ui.label(&display);
+
+                                        if is_long {
+                                            response.clone().on_hover_text(cell);
+                                        }
+
+                                        if response.double_clicked() {
+                                            if is_long {
+                                                // Long cell → floating multiline popover
+                                                new_popover = Some(CellPopover {
+                                                    open: true,
+                                                    row_idx,
+                                                    col_idx,
+                                                    buffer: cell.clone(),
+                                                    pos: response.rect.min,
+                                                });
+                                            } else {
+                                                // Short cell → inline single-line edit
+                                                new_editing_cell =
+                                                    Some(Some((row_idx, col_idx)));
+                                                new_edit_buffer = Some(cell.clone());
+                                            }
+                                        }
+                                    }
+                                });
                             }
                         });
                     });
-                    ui.separator();
+            }); // end ScrollArea
 
-                    egui::ScrollArea::horizontal().show(ui, |ui| {
-                        TableBuilder::new(ui)
-                            .striped(true)
-                            .resizable(true)
-                            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                            .columns(Column::auto().resizable(true), columns.len())
-                            .header(24.0, |mut header| {
-                                for col_name in &columns {
-                                    header.col(|ui| {
-                                        ui.strong(col_name);
-                                    });
-                                }
-                            })
-                            .body(|body| {
-                                body.rows(20.0, rows.len(), |mut row| {
-                                    let row_data = &rows[row.index()];
-                                    for cell in row_data {
-                                        row.col(|ui| {
-                                            ui.label(cell);
-                                        });
-                                    }
-                                });
-                            });
-                    });
+            // ── Below-table controls ──────────────────────────────────────
+            if let Some(err) = new_row_error {
+                ui.colored_label(egui::Color32::RED, err);
+            }
+            ui.horizontal(|ui| {
+                if ui.button("+ Insert row").clicked() {
+                    do_commit_insert = true;
                 }
+            });
+
+            // ── Apply all deferred mutations ──────────────────────────────
+            if let Some(buf) = new_edit_buffer {
+                if let Some(view) = &mut self.table_view {
+                    view.edit_buffer = buf;
+                }
+            }
+            if let Some(cell) = new_editing_cell {
+                if let Some(view) = &mut self.table_view {
+                    view.editing_cell = cell;
+                }
+            }
+            for (col_idx, val) in new_row_updates {
+                if let Some(view) = &mut self.table_view {
+                    if col_idx < view.new_row.len() {
+                        view.new_row[col_idx] = val;
+                    }
+                }
+            }
+            if do_cancel_edit {
+                if let Some(view) = &mut self.table_view {
+                    view.editing_cell = None;
+                    view.edit_buffer.clear();
+                }
+            }
+            if do_commit_edit {
+                self.commit_edit();
+            }
+            if do_commit_insert {
+                self.commit_insert();
+            }
+            // Apply new popover last so it doesn't clobber an open one mid-edit
+            if let Some(p) = new_popover {
+                self.cell_popover = Some(p);
             }
         });
     }
