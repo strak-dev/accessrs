@@ -16,7 +16,22 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "AccessRS",
         options,
-        Box::new(|_cc| Ok(Box::new(App::default()))),
+        Box::new(|cc| {
+            let mut fonts = egui::FontDefinitions::default();
+            fonts.font_data.insert(
+                "fira_nerd".to_owned(),
+                egui::FontData::from_static(include_bytes!("../fonts/FiraCodeNerdFont-Regular.ttf")).into(),
+            );
+            // Set as first priority for proportional and monospace
+            fonts.families.entry(egui::FontFamily::Proportional)
+                .or_default()
+                .insert(0, "fira_nerd".to_owned());
+            fonts.families.entry(egui::FontFamily::Monospace)
+                .or_default()
+                .insert(0, "fira_nerd".to_owned());
+            cc.egui_ctx.set_fonts(fonts);
+            Ok(Box::new(App::default()))
+        }),
     )
 }
 
@@ -37,6 +52,7 @@ enum ColType {
     Real,
     Blob,
     Date,
+    ForeignKey(String),
 }
 
 impl ColType {
@@ -47,6 +63,7 @@ impl ColType {
             ColType::Real => "REAL",
             ColType::Blob => "BLOB",
             ColType::Date => "DATE",
+            ColType::ForeignKey(_) => "FK",
         }
     }
     fn sql_type(&self) -> &str {
@@ -55,10 +72,12 @@ impl ColType {
             ColType::Integer => "INTEGER",
             ColType::Real => "REAL",
             ColType::Blob => "BLOB",
-            ColType::Date => "DATE", // SQLite stores as text, detectable via PRAGMA
+            ColType::Date => "DATE",
+            ColType::ForeignKey(_) => "INTEGER",
         }
     }
-    fn all() -> &'static [ColType] {
+    // all() is intentionally without ForeignKey — it's added dynamically in the UI
+    fn base_types() -> &'static [ColType] {
         &[ColType::Text, ColType::Integer, ColType::Real, ColType::Blob, ColType::Date]
     }
 }
@@ -118,7 +137,7 @@ impl CreateTableDialog {
         let rest: Vec<String> = self
             .columns
             .iter()
-            .skip(1) // skip the locked id row
+            .skip(1)
             .filter(|c| !c.name.trim().is_empty())
             .map(|c| {
                 let mut def = format!("{} {}", c.name.trim(), c.col_type.sql_type());
@@ -127,6 +146,9 @@ impl CreateTableDialog {
                 }
                 if c.not_null && !c.primary_key {
                     def.push_str(" NOT NULL");
+                }
+                if let ColType::ForeignKey(ref_table) = &c.col_type {
+                    def.push_str(&format!(" REFERENCES {}(id)", ref_table));
                 }
                 def
             })
@@ -166,6 +188,13 @@ enum SortDir {
     Desc,
 }
 
+#[derive(Clone)]
+struct ForeignKeyInfo {
+    col_idx: usize,
+    ref_table: String,
+    ref_col: String,
+}
+
 struct TableView {
     table_name: String,
     columns: Vec<String>,
@@ -178,6 +207,8 @@ struct TableView {
     sort_col: Option<usize>,
     sort_dir: SortDir,
     date_columns: std::collections::HashSet<usize>,
+    foreign_keys: Vec<ForeignKeyInfo>,
+    highlighted_row: Option<usize>,
 }
 
 impl TableView {
@@ -194,6 +225,8 @@ impl TableView {
             sort_col: None,
             sort_dir: SortDir::Asc,
             date_columns: std::collections::HashSet::new(),
+            foreign_keys: vec![],
+            highlighted_row: None,
         };
 
         // Single PRAGMA call — load column names AND detect DATE columns together
@@ -224,6 +257,24 @@ impl TableView {
 
         view.new_row = vec![String::new(); view.columns.len()];
         view.reload_rows(conn);
+        // Load FK metadata
+        if let Ok(mut stmt) = conn.prepare(&format!("PRAGMA foreign_key_list({})", table_name)) {
+            let fks: Vec<ForeignKeyInfo> = stmt
+                .query_map([], |row| {
+                    let ref_table: String = row.get(2)?; // table
+                    let from_col: String = row.get(3)?;  // from (local col name)
+                    let ref_col: String = row.get(4)?;   // to (remote col name)
+                    Ok((from_col, ref_table, ref_col))
+                })
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .filter_map(|(from_col, ref_table, ref_col)| {
+                    let col_idx = view.columns.iter().position(|c| c == &from_col)?;
+                    Some(ForeignKeyInfo { col_idx, ref_table, ref_col })
+                })
+                .collect();
+            view.foreign_keys = fks;
+        }
         view
     }
 
@@ -316,6 +367,7 @@ impl App {
     fn open_db(&mut self, path: std::path::PathBuf) {
         match Connection::open(&path) {
             Ok(conn) => {
+                let _ = conn.execute_batch("PRAGMA foreign_keys = ON;");
                 self.db_path = Some(path.display().to_string());
                 self.status = format!("Opened: {}", path.display());
                 self.conn = Some(conn);
@@ -593,16 +645,33 @@ impl eframe::App for App {
                                 ui.add(
                                     egui::TextEdit::singleline(&mut col.name).desired_width(140.0),
                                 );
+                                let type_label = match &col.col_type {
+                                    ColType::ForeignKey(t) => format!("FK → {}", t),
+                                    other => other.label().to_string(),
+                                };
                                 egui::ComboBox::from_id_salt(format!("col_type_{i}"))
-                                    .selected_text(col.col_type.label())
-                                    .width(90.0)
+                                    .selected_text(type_label)
+                                    .width(130.0)
                                     .show_ui(ui, |ui| {
-                                        for t in ColType::all() {
+                                        for t in ColType::base_types() {
                                             ui.selectable_value(
                                                 &mut col.col_type,
                                                 t.clone(),
                                                 t.label(),
                                             );
+                                        }
+                                        // FK options — one per existing table
+                                        if !self.tables.is_empty() {
+                                            ui.separator();
+                                            for table in &self.tables.clone() {
+                                                let fk = ColType::ForeignKey(table.clone());
+                                                let fk_label = format!("FK → {}", table);
+                                                ui.selectable_value(
+                                                    &mut col.col_type,
+                                                    fk,
+                                                    fk_label,
+                                                );
+                                            }
                                         }
                                     });
                                 ui.checkbox(&mut col.primary_key, "");
@@ -811,7 +880,7 @@ impl eframe::App for App {
             }
 
             // Clone everything needed before any mutable borrows
-            let (table_name, columns, rows, error, editing_cell, new_row, new_row_error, sort_col, sort_dir, date_columns) =
+            let (table_name, columns, rows, error, editing_cell, new_row, new_row_error, sort_col, sort_dir, date_columns, foreign_keys, highlighted_row) =
                 match &self.table_view {
                     None => return,
                     Some(v) => (
@@ -825,6 +894,8 @@ impl eframe::App for App {
                         v.sort_col,
                         v.sort_dir.clone(),
                         v.date_columns.clone(),
+                        v.foreign_keys.clone(),
+                        v.highlighted_row,
                     ),
                 };
 
@@ -857,6 +928,7 @@ impl eframe::App for App {
             let mut new_row_updates: Vec<(usize, String)> = vec![];
             let mut new_popover: Option<CellPopover> = None;
             let mut sort_click: Option<usize> = None;
+            let mut navigate_to: Option<(String, String)> = None; // (table, id value)
 
             egui::ScrollArea::both().show(ui, |ui| {
                 TableBuilder::new(ui)
@@ -958,14 +1030,41 @@ impl eframe::App for App {
                                     } else {
                                         // ── Display cell ──────────────────
                                         let is_long = cell.len() > 60;
-                                        
+                                        let is_fk = foreign_keys.iter().find(|fk| fk.col_idx == col_idx);
+                                        let is_highlighted = highlighted_row == Some(row_idx);
+
                                         let display = if is_long {
                                             format!("{}…", &cell[..60])
                                         } else {
                                             cell.clone()
                                         };
 
-                                    let response = ui.label(&display);
+                                        // highlight the navigated-to row
+                                        if is_highlighted {
+                                            ui.painter().rect_filled(
+                                                ui.available_rect_before_wrap(),
+                                                0.0,
+                                                egui::Color32::from_rgba_unmultiplied(255, 255, 0, 5),
+                                            );
+                                        }
+
+                                        let response = if let Some(fk) = is_fk {
+                                            // FK cell — render as a clickable link
+                                            let link = ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(format!("→ {}", display))
+                                                        .color(egui::Color32::from_rgb(100, 160, 255))
+                                                        .underline(),
+                                                )
+                                                .sense(egui::Sense::click()),
+                                            );
+                                            if link.clicked() {
+                                                navigate_to = Some((fk.ref_table.clone(), cell.clone()));
+                                            }
+                                            link
+                                        } else {
+                                            ui.label(&display)
+                                        };
                                     let rect_min = response.rect.min;
                                     let double_clicked = response.double_clicked();
 
@@ -1063,6 +1162,19 @@ impl eframe::App for App {
                     }
                     view.apply_sort();
                 }
+            }
+
+            if let Some((ref_table, ref_id)) = navigate_to {
+                self.select_table(&ref_table.clone());
+                // find the row in the newly loaded view and highlight it
+                if let Some(view) = &mut self.table_view {
+                    let id_col = view.columns.iter().position(|c| c == "id").unwrap_or(0);
+                    view.highlighted_row = view.rows.iter().position(|r| {
+                        r.get(id_col).map(|v| v == &ref_id).unwrap_or(false)
+                    });
+                }
+                // update sidebar selection
+                self.selected_table = Some(ref_table);
             }
         });
     }
