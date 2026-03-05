@@ -1,3 +1,4 @@
+pub mod app_ui;
 pub mod create_dialog;
 pub mod empty_state;
 pub mod popover;
