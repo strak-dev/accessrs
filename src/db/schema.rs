@@ -15,6 +15,7 @@ pub enum ColType {
     Date,
     ForeignKey(String),
     Note,
+    Boolean,
 }
 
 impl ColType {
@@ -27,6 +28,7 @@ impl ColType {
             ColType::Date => "DATE",
             ColType::ForeignKey(_) => "FK",
             ColType::Note => "NOTE",
+            ColType::Boolean => "BOOLEAN",
         }
     }
     pub fn sql_type(&self) -> &str {
@@ -38,10 +40,11 @@ impl ColType {
             ColType::Date => "DATE",
             ColType::ForeignKey(_) => "INTEGER",
             ColType::Note => "NOTE",
+            ColType::Boolean => "INTEGER"
         }
     }
     pub fn base_types() -> &'static [ColType] {
-        &[ColType::Text, ColType::Integer, ColType::Real, ColType::Blob, ColType::Date, ColType::Note]
+        &[ColType::Text, ColType::Integer, ColType::Real, ColType::Blob, ColType::Date, ColType::Note, ColType::Boolean]
     }
 }
 

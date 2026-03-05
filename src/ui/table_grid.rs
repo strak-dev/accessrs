@@ -46,6 +46,7 @@ pub fn show(app: &App, ui: &mut egui::Ui, actions: &mut GridActions) {
     let sort_dir = view.sort_dir.clone();
     let date_columns = view.date_columns.clone();
     let note_columns = view.note_columns.clone();
+    let bool_columns = view.bool_columns.clone();
     let foreign_keys = view.foreign_keys.clone();
     let highlighted_row = view.highlighted_row;
     let edit_buffer = view.edit_buffer.clone();
@@ -86,6 +87,12 @@ pub fn show(app: &App, ui: &mut egui::Ui, actions: &mut GridActions) {
                         row.col(|ui| { ui.weak("*"); });
                         for (col_idx, val) in new_row.iter().enumerate() {
                             row.col(|ui| {
+                                if bool_columns.contains(&col_idx) {
+                                    let mut checked = val == "1";
+                                    if ui.checkbox(&mut checked, "").changed() {
+                                        actions.new_row_updates.push((col_idx, if checked { "1".to_string() } else { "0".to_string() }));
+                                    }
+                                } else {
                                 let mut buf = val.clone();
                                 let response = ui.add(
                                     egui::TextEdit::singleline(&mut buf)
@@ -99,6 +106,7 @@ pub fn show(app: &App, ui: &mut egui::Ui, actions: &mut GridActions) {
                                     && ui.input(|i| i.key_pressed(egui::Key::Enter))
                                 {
                                     actions.do_commit_insert = true;
+                                }
                                 }
                             });
                         }
@@ -114,7 +122,9 @@ pub fn show(app: &App, ui: &mut egui::Ui, actions: &mut GridActions) {
                         row.col(|ui| {
                             let is_editing = editing_cell == Some((row_idx, col_idx));
 
-                            if is_editing {
+                            let is_bool = bool_columns.contains(&col_idx);
+
+                            if is_editing && !is_bool {
                                 let mut buf = match &actions.new_edit_buffer {
                                     Some(b) => b.clone(),
                                     None => edit_buffer.clone(),
@@ -167,7 +177,17 @@ pub fn show(app: &App, ui: &mut egui::Ui, actions: &mut GridActions) {
                                     );
                                 }
 
-                                let response = if let Some(fk) = is_fk {
+                                let response = if is_bool {
+                                    let mut checked = cell == "1";
+                                    let cb = ui.checkbox(&mut checked, "");
+                                    if cb.changed() {
+                                        let new_val = if checked { "1" } else { "0" }.to_string();
+                                        actions.new_editing_cell = Some(Some((row_idx, col_idx)));
+                                        actions.new_edit_buffer = Some(new_val);
+                                        actions.do_commit_edit = true;
+                                    }
+                                    cb
+                                } else if let Some(fk) = is_fk {
                                     let link = ui.add(
                                         egui::Label::new(
                                             egui::RichText::new(format!("-> {}", display))
@@ -188,6 +208,9 @@ pub fn show(app: &App, ui: &mut egui::Ui, actions: &mut GridActions) {
                                 let double_clicked = response.double_clicked();
 
                                 if double_clicked {
+                                    if is_bool {
+
+                                    } else {
                                     let is_date = date_columns.contains(&col_idx);
                                     if is_note {
                                         actions.new_popover = Some(CellPopover {
@@ -224,6 +247,7 @@ pub fn show(app: &App, ui: &mut egui::Ui, actions: &mut GridActions) {
                                         actions.new_editing_cell = Some(Some((row_idx, col_idx)));
                                         actions.new_edit_buffer = Some(cell.clone());
                                     }
+                                }
                                 }
                             }
                         });

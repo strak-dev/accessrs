@@ -14,6 +14,7 @@ pub struct TableView {
     pub sort_dir: SortDir,
     pub date_columns: std::collections::HashSet<usize>,
     pub note_columns: std::collections::HashSet<usize>,
+    pub bool_columns: std::collections::HashSet<usize>,
     pub foreign_keys: Vec<ForeignKeyInfo>,
     pub highlighted_row: Option<usize>,
 }
@@ -33,6 +34,7 @@ impl TableView {
             sort_dir: SortDir::Asc,
             date_columns: std::collections::HashSet::new(),
             note_columns: std::collections::HashSet::new(),
+            bool_columns: std::collections::HashSet::new(),
             foreign_keys: vec![],
             highlighted_row: None,
         };
@@ -59,6 +61,7 @@ impl TableView {
                     match col_type.to_uppercase().as_str() {
                         "DATE" => { view.date_columns.insert(idx); }
                         "NOTE" => { view.note_columns.insert(idx); }
+                        "BOOLEAN" => { view.bool_columns.insert(idx); }
                         _ => {}
                     }
                 }
