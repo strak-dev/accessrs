@@ -36,6 +36,7 @@ enum ColType {
     Integer,
     Real,
     Blob,
+    Date,
 }
 
 impl ColType {
@@ -45,10 +46,20 @@ impl ColType {
             ColType::Integer => "INTEGER",
             ColType::Real => "REAL",
             ColType::Blob => "BLOB",
+            ColType::Date => "DATE",
+        }
+    }
+    fn sql_type(&self) -> &str {
+        match self {
+            ColType::Text => "TEXT",
+            ColType::Integer => "INTEGER",
+            ColType::Real => "REAL",
+            ColType::Blob => "BLOB",
+            ColType::Date => "DATE", // SQLite stores as text, detectable via PRAGMA
         }
     }
     fn all() -> &'static [ColType] {
-        &[ColType::Text, ColType::Integer, ColType::Real, ColType::Blob]
+        &[ColType::Text, ColType::Integer, ColType::Real, ColType::Blob, ColType::Date]
     }
 }
 
@@ -110,7 +121,7 @@ impl CreateTableDialog {
             .skip(1) // skip the locked id row
             .filter(|c| !c.name.trim().is_empty())
             .map(|c| {
-                let mut def = format!("{} {}", c.name.trim(), c.col_type.label());
+                let mut def = format!("{} {}", c.name.trim(), c.col_type.sql_type());
                 if c.primary_key {
                     def.push_str(" PRIMARY KEY");
                 }
@@ -133,12 +144,18 @@ impl CreateTableDialog {
 
 // ── Cell popover ──────────────────────────────────────────────────────────────
 
+enum PopoverMode {
+    Text,
+    Date(chrono::NaiveDate),
+}
+
 struct CellPopover {
     open: bool,
     row_idx: usize,
     col_idx: usize,
-    buffer: String,
+    buffer: String,        // used for text mode and final committed value
     pos: egui::Pos2,
+    mode: PopoverMode,
 }
 
 // ── Table view (loaded data + edit state) ────────────────────────────────────
@@ -160,6 +177,7 @@ struct TableView {
     new_row_error: Option<String>,
     sort_col: Option<usize>,
     sort_dir: SortDir,
+    date_columns: std::collections::HashSet<usize>,
 }
 
 impl TableView {
@@ -175,19 +193,32 @@ impl TableView {
             new_row_error: None,
             sort_col: None,
             sort_dir: SortDir::Asc,
+            date_columns: std::collections::HashSet::new(),
         };
 
+        // Single PRAGMA call — load column names AND detect DATE columns together
         match conn.prepare(&format!("PRAGMA table_info({})", table_name)) {
             Err(e) => {
                 view.error = Some(format!("Failed to load schema: {e}"));
                 return view;
             }
             Ok(mut stmt) => {
-                view.columns = stmt
-                    .query_map([], |row| row.get::<_, String>(1))
+                let results: Vec<(String, String)> = stmt
+                    .query_map([], |row| {
+                        let name: String = row.get(1)?;  // col 1 = name
+                        let col_type: String = row.get(2)?; // col 2 = type
+                        Ok((name, col_type))
+                    })
                     .unwrap()
                     .filter_map(|r| r.ok())
                     .collect();
+
+                for (idx, (name, col_type)) in results.into_iter().enumerate() {
+                    view.columns.push(name);
+                    if col_type.to_uppercase() == "DATE" {
+                        view.date_columns.insert(idx);
+                    }
+                }
             }
         }
 
@@ -621,38 +652,71 @@ impl eframe::App for App {
 
         if let Some(popover) = &mut self.cell_popover {
             let mut win_open = popover.open;
-            egui::Window::new("Edit Cell")
+
+            let (title, window_size) = match &popover.mode {
+                PopoverMode::Date(_) => ("Pick Date", [280.0, 60.0]),
+                PopoverMode::Text => ("Edit Cell", [320.0, 240.0]),
+            };
+
+            egui::Window::new(title)
                 .open(&mut win_open)
-                .default_pos(popover.pos)  // moveable — default_pos not fixed_pos
-                .default_size([320.0, 240.0])
-                .min_size([200.0, 120.0])
+                .default_pos(popover.pos)
+                .default_size(window_size)
+                .min_size([200.0, 60.0])
                 .collapsible(false)
                 .resizable(true)
                 .show(ctx, |ui| {
-                    egui::ScrollArea::vertical()
-                        .max_height(160.0)
-                        .show(ui, |ui| {
-                            ui.add(
-                                egui::TextEdit::multiline(&mut popover.buffer)
-                                    .desired_width(f32::INFINITY)
-                                    .desired_rows(6),
-                            );
-                        });
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        if ui.button("Save").clicked() {
-                            popover_commit = true;
+                    match &mut popover.mode {
+                        PopoverMode::Date(date) => {
+                            ui.horizontal(|ui| {
+                                ui.label("Date:");
+                                ui.add(
+                                    egui_extras::DatePickerButton::new(date)
+                                        .id_salt("cell_date_picker"),
+                                );
+                            });
+                            ui.add_space(4.0);
+                            ui.separator();
+                            ui.horizontal(|ui| {
+                                if ui.button("Save").clicked() {
+                                    popover.buffer = date.format("%Y-%m-%d").to_string();
+                                    popover_commit = true;
+                                }
+                                if ui.button("Cancel").clicked() {
+                                    popover_cancel = true;
+                                }
+                            });
+                            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                popover_cancel = true;
+                            }
                         }
-                        if ui.button("Cancel").clicked() {
-                            popover_cancel = true;
+                        PopoverMode::Text => {
+                            egui::ScrollArea::vertical()
+                                .max_height(160.0)
+                                .show(ui, |ui| {
+                                    ui.add(
+                                        egui::TextEdit::multiline(&mut popover.buffer)
+                                            .desired_width(f32::INFINITY)
+                                            .desired_rows(6),
+                                    );
+                                });
+                            ui.separator();
+                            ui.horizontal(|ui| {
+                                if ui.button("Save").clicked() {
+                                    popover_commit = true;
+                                }
+                                if ui.button("Cancel").clicked() {
+                                    popover_cancel = true;
+                                }
+                                ui.weak("Ctrl+Enter  •  Esc to cancel");
+                            });
+                            if ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Enter)) {
+                                popover_commit = true;
+                            }
+                            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                popover_cancel = true;
+                            }
                         }
-                        ui.weak("Ctrl+Enter  •  Esc to cancel");
-                    });
-                    if ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Enter)) {
-                        popover_commit = true;
-                    }
-                    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                        popover_cancel = true;
                     }
                 });
             if !win_open {
@@ -747,7 +811,7 @@ impl eframe::App for App {
             }
 
             // Clone everything needed before any mutable borrows
-            let (table_name, columns, rows, error, editing_cell, new_row, new_row_error, sort_col, sort_dir) =
+            let (table_name, columns, rows, error, editing_cell, new_row, new_row_error, sort_col, sort_dir, date_columns) =
                 match &self.table_view {
                     None => return,
                     Some(v) => (
@@ -760,6 +824,7 @@ impl eframe::App for App {
                         v.new_row_error.clone(),
                         v.sort_col,
                         v.sort_dir.clone(),
+                        v.date_columns.clone(),
                     ),
                 };
 
@@ -893,6 +958,7 @@ impl eframe::App for App {
                                     } else {
                                         // ── Display cell ──────────────────
                                         let is_long = cell.len() > 60;
+                                        
                                         let display = if is_long {
                                             format!("{}…", &cell[..60])
                                         } else {
@@ -903,20 +969,30 @@ impl eframe::App for App {
                                     let rect_min = response.rect.min;
                                     let double_clicked = response.double_clicked();
 
-                                    if double_clicked {
-                                            if is_long {
-                                                // Long cell → floating multiline popover
+                                        if double_clicked {
+                                            let is_date = date_columns.contains(&col_idx);
+                                            if is_date {
+                                                let parsed = chrono::NaiveDate::parse_from_str(cell, "%Y-%m-%d")
+                                                    .unwrap_or_else(|_| chrono::Local::now().date_naive());
                                                 new_popover = Some(CellPopover {
                                                     open: true,
                                                     row_idx,
                                                     col_idx,
                                                     buffer: cell.clone(),
                                                     pos: rect_min,
+                                                    mode: PopoverMode::Date(parsed),
+                                                });
+                                            } else if is_long {
+                                                new_popover = Some(CellPopover {
+                                                    open: true,
+                                                    row_idx,
+                                                    col_idx,
+                                                    buffer: cell.clone(),
+                                                    pos: rect_min,
+                                                    mode: PopoverMode::Text,
                                                 });
                                             } else {
-                                                // Short cell → inline single-line edit
-                                                new_editing_cell =
-                                                    Some(Some((row_idx, col_idx)));
+                                                new_editing_cell = Some(Some((row_idx, col_idx)));
                                                 new_edit_buffer = Some(cell.clone());
                                             }
                                         }
