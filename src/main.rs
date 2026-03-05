@@ -4,7 +4,7 @@ mod db;
 mod ui;
 mod easy_mark;
 
-use db::schema::{ColumnDef, ColType, SortDir};
+use db::schema::SortDir;
 use db::table_view::TableView;
 use ui::create_dialog::CreateTableDialog;
 
@@ -331,109 +331,9 @@ impl eframe::App for App {
         });
 
         // Create table modal
-        if self.create_dialog.open {
-            egui::Window::new("Create Table")
-                .collapsible(false)
-                .resizable(true)
-                .min_width(500.0)
-                .show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Table name:");
-                        ui.text_edit_singleline(&mut self.create_dialog.table_name);
-                    });
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("Column Name").strong());
-                        ui.add_space(80.0);
-                        ui.label(egui::RichText::new("Type").strong());
-                        ui.add_space(40.0);
-                        ui.label(egui::RichText::new("PK").strong());
-                        ui.add_space(8.0);
-                        ui.label(egui::RichText::new("Not Null").strong());
-                    });
-                    ui.separator();
-                    let mut to_delete: Option<usize> = None;
-                    for (i, col) in self.create_dialog.columns.iter_mut().enumerate() {
-                        let is_id = i == 0;
-                        ui.horizontal(|ui| {
-                            if is_id {
-                                ui.add_enabled(
-                                    false,
-                                    egui::TextEdit::singleline(&mut col.name).desired_width(140.0),
-                                );
-                                ui.add_enabled(
-                                    false,
-                                    egui::Button::new("INTEGER  •  AUTOINCREMENT  •  PK"),
-                                );
-                            } else {
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut col.name).desired_width(140.0),
-                                );
-                                let type_label = match &col.col_type {
-                                    ColType::ForeignKey(t) => format!("FK → {}", t),
-                                    other => other.label().to_string(),
-                                };
-                                egui::ComboBox::from_id_salt(format!("col_type_{i}"))
-                                    .selected_text(type_label)
-                                    .width(130.0)
-                                    .show_ui(ui, |ui| {
-                                        for t in ColType::base_types() {
-                                            ui.selectable_value(
-                                                &mut col.col_type,
-                                                t.clone(),
-                                                t.label(),
-                                            );
-                                        }
-                                        // FK options — one per existing table
-                                        if !self.tables.is_empty() {
-                                            ui.separator();
-                                            for table in &self.tables.clone() {
-                                                let fk = ColType::ForeignKey(table.clone());
-                                                let fk_label = format!("FK → {}", table);
-                                                ui.selectable_value(
-                                                    &mut col.col_type,
-                                                    fk,
-                                                    fk_label,
-                                                );
-                                            }
-                                        }
-                                    });
-                                ui.checkbox(&mut col.primary_key, "");
-                                ui.add_space(16.0);
-                                ui.checkbox(&mut col.not_null, "");
-                                ui.add_space(16.0);
-                                if ui.small_button("×").clicked() {
-                                    to_delete = Some(i);
-                                }
-                            }
-                        });
-                    }
-                    if let Some(i) = to_delete {
-                        self.create_dialog.columns.remove(i);
-                    }
-                    ui.add_space(4.0);
-                    if ui.button("+ Add column").clicked() {
-                        self.create_dialog.columns.push(ColumnDef::default());
-                    }
-                    ui.add_space(8.0);
-                    ui.separator();
-                    if let Ok(sql) = self.create_dialog.to_sql() {
-                        ui.label(egui::RichText::new(&sql).monospace().weak());
-                    }
-                    if let Some(err) = self.create_dialog.error.clone() {
-                        ui.colored_label(egui::Color32::RED, err);
-                    }
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("Create").clicked() {
-                            self.create_table();
-                        }
-                        if ui.button("Cancel").clicked() {
-                            self.create_dialog.reset();
-                        }
-                    });
-                });
+        let tables = self.tables.clone();
+        if self.create_dialog.show(ctx, &tables) {
+            self.create_table();
         }
 
         // ── Cell popover editor ───────────────────────────────────────────────
