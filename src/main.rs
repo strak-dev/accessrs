@@ -6,12 +6,15 @@ mod easy_mark;
 
 use db::schema::SortDir;
 use db::table_view::TableView;
+
 use ui::create_dialog::CreateTableDialog;
-use ui::popover::{CellPopover, PopoverMode};
+use ui::empty_state;
+use ui::popover::CellPopover;
 use ui::sidebar;
+use ui::table_grid;
+use ui::toolbar;
 
 use eframe::egui;
-use egui_extras::{Column, TableBuilder};
 use rfd::FileDialog;
 use rusqlite::Connection;
 
@@ -347,286 +350,45 @@ impl eframe::App for App {
         // Main panel
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.conn.is_none() {
-                ui.centered_and_justified(|ui| {
-                    ui.vertical_centered(|ui| {
-                        ui.heading("No database open");
-                        ui.add_space(8.0);
-                        if ui.button("Open database…").clicked() {
-                            if let Some(path) = FileDialog::new()
-                                .add_filter("SQLite", &["db", "sqlite", "sqlite3"])
-                                .pick_file()
-                            {
-                                self.open_db(path);
-                            }
-                        }
-                        if ui.button("New database…").clicked() {
-                            if let Some(path) = FileDialog::new()
-                                .add_filter("SQLite", &["db", "sqlite", "sqlite3"])
-                                .set_file_name("new_database.db")
-                                .save_file()
-                            {
-                                self.open_db(path);
-                            }
-                        }
-                    });
-                });
+                empty_state::show_no_db(self, ui);
                 return;
             }
 
             if self.selected_table.is_none() {
-                ui.centered_and_justified(|ui| {
-                    ui.label("Select a table from the sidebar.");
-                });
+                empty_state::show_no_table(ui);
                 return;
             }
 
-            // Clone everything needed before any mutable borrows
-            let (table_name, columns, rows, error, editing_cell, new_row, new_row_error, sort_col, sort_dir, date_columns, note_columns, foreign_keys, highlighted_row) =
-                match &self.table_view {
-                    None => return,
-                    Some(v) => (
-                        v.table_name.clone(),
-                        v.columns.clone(),
-                        v.rows.clone(),
-                        v.error.clone(),
-                        v.editing_cell,
-                        v.new_row.clone(),
-                        v.new_row_error.clone(),
-                        v.sort_col,
-                        v.sort_dir.clone(),
-                        v.date_columns.clone(),
-                        v.note_columns.clone(),
-                        v.foreign_keys.clone(),
-                        v.highlighted_row,
-                    ),
-                };
-
-            if let Some(err) = error {
+            if let Some(err) = self.table_view.as_ref().and_then(|v| v.error.clone()) {
                 ui.colored_label(egui::Color32::RED, err);
                 return;
             }
 
+            let table_name = match &self.table_view {
+                Some(v) => v.table_name.clone(),
+                None => return,
+            };
+
             // Toolbar
-            ui.horizontal(|ui| {
-                ui.heading(&table_name);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("↺ Refresh").clicked() {
-                        if let Some(conn) = &self.conn {
-                            if let Some(view) = &mut self.table_view {
-                                view.reload_rows(conn);
-                            }
-                        }
-                    }
-                });
-            });
-            ui.separator();
+            toolbar::show(self, ui, &table_name);
 
-            // Deferred action flags — collected during table render, applied after
-            let mut do_commit_edit = false;
-            let mut do_cancel_edit = false;
-            let mut new_editing_cell: Option<Option<(usize, usize)>> = None;
-            let mut new_edit_buffer: Option<String> = None;
-            let mut do_commit_insert = false;
-            let mut new_row_updates: Vec<(usize, String)> = vec![];
-            let mut new_popover: Option<CellPopover> = None;
-            let mut sort_click: Option<usize> = None;
-            let mut navigate_to: Option<(String, String)> = None; // (table, id value)
+            let mut actions = table_grid::GridActions::default();
+            table_grid::show(self, ui, &mut actions);
 
-            egui::ScrollArea::both().show(ui, |ui| {
-                TableBuilder::new(ui)
-                    .striped(true)
-                    .resizable(true)
-                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                    .column(Column::exact(36.0))
-                    .columns(Column::auto().resizable(true).clip(true), columns.len())
-                    .header(24.0, |mut header| {
-                        header.col(|ui| {
-                            ui.weak("#");
-                        });
-                        for (col_idx, col_name) in columns.iter().enumerate() {
-                            header.col(|ui| {
-                                let arrow = match sort_col {
-                                    Some(i) if i == col_idx => {
-                                        if sort_dir == SortDir::Asc { " ▲" } else { " ▼" }
-                                    }
-                                    _ => "",
-                                };
-                                let label = format!("{}{}", col_name, arrow);
-                                if ui.button(egui::RichText::new(label).strong()).clicked() {
-                                    sort_click = Some(col_idx);
-                                }
-                            });
-                        }
-                    })
-                    .body(|body| {
-                        let total_rows = rows.len() + 1;
-                        body.rows(24.0, total_rows, |mut row| {
-                            let row_idx = row.index();
-
-                            // ── New-row insert strip ──────────────────────
-                            if row_idx == rows.len() {
-                                row.col(|ui| {
-                                    ui.weak("*");
-                                });
-                                for (col_idx, val) in new_row.iter().enumerate() {
-                                    row.col(|ui| {
-                                        let mut buf = val.clone();
-                                        let response = ui.add(
-                                            egui::TextEdit::singleline(&mut buf)
-                                                .desired_width(f32::INFINITY)
-                                                .hint_text("…"),
-                                        );
-                                        if buf != *val {
-                                            new_row_updates.push((col_idx, buf));
-                                        }
-                                        if response.lost_focus()
-                                            && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                                        {
-                                            do_commit_insert = true;
-                                        }
-                                    });
-                                }
-                                return;
-                            }
-
-                            // ── Existing rows ─────────────────────────────
-                            row.col(|ui| {
-                                ui.weak((row_idx + 1).to_string());
-                            });
-
-                            for (col_idx, cell) in rows[row_idx].iter().enumerate() {
-                                row.col(|ui| {
-                                    let is_editing = editing_cell == Some((row_idx, col_idx));
-
-                                    if is_editing {
-                                        let mut buf = match &new_edit_buffer {
-                                            Some(b) => b.clone(),
-                                            None => {
-                                                if let Some(view) = self.table_view.as_ref() {
-                                                    view.edit_buffer.clone()
-                                                } else {
-                                                    cell.clone()
-                                                }
-                                            }
-                                        };
-
-                                        let response = ui.add(
-                                            egui::TextEdit::singleline(&mut buf)
-                                                .desired_width(f32::INFINITY),
-                                        );
-                                        response.request_focus();
-                                        new_edit_buffer = Some(buf);
-
-                                        let enter =
-                                            ui.input(|i| i.key_pressed(egui::Key::Enter));
-                                        let escape =
-                                            ui.input(|i| i.key_pressed(egui::Key::Escape));
-
-                                        if enter {
-                                            do_commit_edit = true;
-                                        } else if escape {
-                                            do_cancel_edit = true;
-                                        } else if response.lost_focus() {
-                                            do_commit_edit = true;
-                                        }
-                                    } else {
-                                        // ── Display cell ──────────────────
-                                        let is_long = cell.len() > 60;
-                                        let is_fk = foreign_keys.iter().find(|fk| fk.col_idx == col_idx);
-                                        let is_highlighted = highlighted_row == Some(row_idx);
-
-                                        let is_note = note_columns.contains(&col_idx);
-                                        let display = if is_note {
-                                            // show first line only with a note icon
-                                            let first_line = cell.lines().next().unwrap_or("").trim();
-                                            if first_line.is_empty() {
-                                                " Empty note".to_string()
-                                            } else if first_line.len() > 50 {
-                                                format!(" {}…", &first_line[..50])
-                                            } else {
-                                                format!(" {}", first_line)
-                                            }
-                                        } else if is_long {
-                                            format!("{}…", &cell[..60])
-                                        } else {
-                                            cell.clone()
-                                        };
-
-                                        // highlight the navigated-to row
-                                        if is_highlighted {
-                                            ui.painter().rect_filled(
-                                                ui.available_rect_before_wrap(),
-                                                0.0,
-                                                egui::Color32::from_rgba_unmultiplied(255, 255, 0, 5),
-                                            );
-                                        }
-
-                                        let response = if let Some(fk) = is_fk {
-                                            // FK cell — render as a clickable link
-                                            let link = ui.add(
-                                                egui::Label::new(
-                                                    egui::RichText::new(format!("→ {}", display))
-                                                        .color(egui::Color32::from_rgb(100, 160, 255))
-                                                        .underline(),
-                                                )
-                                                .sense(egui::Sense::click()),
-                                            );
-                                            if link.clicked() {
-                                                navigate_to = Some((fk.ref_table.clone(), cell.clone()));
-                                            }
-                                            link
-                                        } else {
-                                            ui.label(&display)
-                                        };
-                                    let rect_min = response.rect.min;
-                                    let double_clicked = response.double_clicked();
-
-                                        if double_clicked {
-                                            let is_date = date_columns.contains(&col_idx);
-                                            let is_note = note_columns.contains(&col_idx);
-                                            if is_note {
-                                                new_popover = Some(CellPopover {
-                                                    open: true,
-                                                    row_idx,
-                                                    col_idx,
-                                                    buffer: cell.clone(),
-                                                    pos: rect_min,
-                                                    mode: PopoverMode::Note { editing: false },
-                                                });
-                                            } else if is_date {
-                                                let parsed = chrono::NaiveDate::parse_from_str(cell, "%Y-%m-%d")
-                                                    .unwrap_or_else(|_| chrono::Local::now().date_naive());
-                                                new_popover = Some(CellPopover {
-                                                    open: true,
-                                                    row_idx,
-                                                    col_idx,
-                                                    buffer: cell.clone(),
-                                                    pos: rect_min,
-                                                    mode: PopoverMode::Date(parsed),
-                                                });
-                                            } else if is_long {
-                                                new_popover = Some(CellPopover {
-                                                    open: true,
-                                                    row_idx,
-                                                    col_idx,
-                                                    buffer: cell.clone(),
-                                                    pos: rect_min,
-                                                    mode: PopoverMode::Text,
-                                                });
-                                            } else {
-                                                new_editing_cell = Some(Some((row_idx, col_idx)));
-                                                new_edit_buffer = Some(cell.clone());
-                                            }
-                                        }
-                                    }
-                                });
-                            }
-                        });
-                    });
-            }); // end ScrollArea
+            let table_grid::GridActions {
+                do_commit_edit,
+                do_cancel_edit,
+                new_editing_cell,
+                new_edit_buffer,
+                mut do_commit_insert,
+                new_row_updates,
+                new_popover,
+                sort_click,
+                navigate_to,
+            } = actions;
 
             // ── Below-table controls ──────────────────────────────────────
-            if let Some(err) = new_row_error {
+            if let Some(err) = self.table_view.as_ref().and_then(|v| v.new_row_error.clone()) {
                 ui.colored_label(egui::Color32::RED, err);
             }
             ui.horizontal(|ui| {
