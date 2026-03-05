@@ -4,14 +4,13 @@ mod db;
 mod ui;
 mod easy_mark;
 
-use db::schema::SortDir;
 use db::table_view::TableView;
 
 use ui::create_dialog::CreateTableDialog;
-use ui::empty_state;
 use ui::popover::CellPopover;
+use ui::empty_state;
 use ui::sidebar;
-use ui::table_grid;
+use ui::table_view as ui_table_view;
 use ui::toolbar;
 
 use eframe::egui;
@@ -372,95 +371,7 @@ impl eframe::App for App {
             // Toolbar
             toolbar::show(self, ui, &table_name);
 
-            let mut actions = table_grid::GridActions::default();
-            table_grid::show(self, ui, &mut actions);
-
-            let table_grid::GridActions {
-                do_commit_edit,
-                do_cancel_edit,
-                new_editing_cell,
-                new_edit_buffer,
-                mut do_commit_insert,
-                new_row_updates,
-                new_popover,
-                sort_click,
-                navigate_to,
-            } = actions;
-
-            // ── Below-table controls ──────────────────────────────────────
-            if let Some(err) = self.table_view.as_ref().and_then(|v| v.new_row_error.clone()) {
-                ui.colored_label(egui::Color32::RED, err);
-            }
-            ui.horizontal(|ui| {
-                if ui.button("+ Insert row").clicked() {
-                    do_commit_insert = true;
-                }
-            });
-
-            // ── Apply all deferred mutations ──────────────────────────────
-            if let Some(buf) = new_edit_buffer {
-                if let Some(view) = &mut self.table_view {
-                    view.edit_buffer = buf;
-                }
-            }
-            if let Some(cell) = new_editing_cell {
-                if let Some(view) = &mut self.table_view {
-                    view.editing_cell = cell;
-                }
-            }
-            for (col_idx, val) in new_row_updates {
-                if let Some(view) = &mut self.table_view {
-                    if col_idx < view.new_row.len() {
-                        view.new_row[col_idx] = val;
-                    }
-                }
-            }
-            if do_cancel_edit {
-                if let Some(view) = &mut self.table_view {
-                    view.editing_cell = None;
-                    view.edit_buffer.clear();
-                }
-            }
-            if do_commit_edit {
-                self.commit_edit();
-            }
-            if do_commit_insert {
-                self.commit_insert();
-            }
-            // Apply new popover last so it doesn't clobber an open one mid-edit
-            if let Some(p) = new_popover {
-                self.cell_popover = Some(p);
-            }
-
-            if let Some(col_idx) = sort_click {
-                if let Some(view) = &mut self.table_view {
-                    if view.sort_col == Some(col_idx) {
-                        // same column — flip direction
-                        view.sort_dir = if view.sort_dir == SortDir::Asc {
-                            SortDir::Desc
-                        } else {
-                            SortDir::Asc
-                        };
-                    } else {
-                        view.sort_col = Some(col_idx);
-                        view.sort_dir = SortDir::Asc;
-                    }
-                    view.apply_sort();
-                }
-            }
-
-            if let Some((ref_table, ref_id)) = navigate_to {
-                self.select_table(&ref_table.clone());
-                // find the row in the newly loaded view and highlight it
-                if let Some(view) = &mut self.table_view {
-                    let id_col = view.columns.iter().position(|c| c == "id").unwrap_or(0);
-                    view.highlighted_row = view.rows.iter().position(|r| {
-                        r.get(id_col).map(|v| v == &ref_id).unwrap_or(false)
-                    });
-                }
-                // update sidebar selection
-                self.selected_table = Some(ref_table);
-            }
+            ui_table_view::show(self, ui);
         });
     }
 }
