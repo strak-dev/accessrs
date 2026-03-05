@@ -4,6 +4,7 @@ use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 use rfd::FileDialog;
 use rusqlite::Connection;
+mod easy_mark;
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
@@ -53,6 +54,7 @@ enum ColType {
     Blob,
     Date,
     ForeignKey(String),
+    Note,
 }
 
 impl ColType {
@@ -64,6 +66,7 @@ impl ColType {
             ColType::Blob => "BLOB",
             ColType::Date => "DATE",
             ColType::ForeignKey(_) => "FK",
+            ColType::Note => "NOTE",
         }
     }
     fn sql_type(&self) -> &str {
@@ -74,11 +77,11 @@ impl ColType {
             ColType::Blob => "BLOB",
             ColType::Date => "DATE",
             ColType::ForeignKey(_) => "INTEGER",
+            ColType::Note => "NOTE", // stored as TEXT, detectable via PRAGMA
         }
     }
-    // all() is intentionally without ForeignKey — it's added dynamically in the UI
     fn base_types() -> &'static [ColType] {
-        &[ColType::Text, ColType::Integer, ColType::Real, ColType::Blob, ColType::Date]
+        &[ColType::Text, ColType::Integer, ColType::Real, ColType::Blob, ColType::Date, ColType::Note]
     }
 }
 
@@ -169,6 +172,7 @@ impl CreateTableDialog {
 enum PopoverMode {
     Text,
     Date(chrono::NaiveDate),
+    Note { editing: bool },
 }
 
 struct CellPopover {
@@ -207,6 +211,7 @@ struct TableView {
     sort_col: Option<usize>,
     sort_dir: SortDir,
     date_columns: std::collections::HashSet<usize>,
+    note_columns: std::collections::HashSet<usize>,
     foreign_keys: Vec<ForeignKeyInfo>,
     highlighted_row: Option<usize>,
 }
@@ -225,6 +230,7 @@ impl TableView {
             sort_col: None,
             sort_dir: SortDir::Asc,
             date_columns: std::collections::HashSet::new(),
+            note_columns: std::collections::HashSet::new(),
             foreign_keys: vec![],
             highlighted_row: None,
         };
@@ -248,8 +254,10 @@ impl TableView {
 
                 for (idx, (name, col_type)) in results.into_iter().enumerate() {
                     view.columns.push(name);
-                    if col_type.to_uppercase() == "DATE" {
-                        view.date_columns.insert(idx);
+                    match col_type.to_uppercase().as_str() {
+                        "DATE" => { view.date_columns.insert(idx); }
+                        "NOTE" => { view.note_columns.insert(idx); }
+                        _ => {}
                     }
                 }
             }
@@ -678,14 +686,11 @@ impl eframe::App for App {
                                 ui.add_space(16.0);
                                 ui.checkbox(&mut col.not_null, "");
                                 ui.add_space(16.0);
-                                if ui.small_button("✕").clicked() {
+                                if ui.small_button("×").clicked() {
                                     to_delete = Some(i);
                                 }
                             }
                         });
-                    }
-                    if let Some(i) = to_delete {
-                        self.create_dialog.columns.remove(i);
                     }
                     if let Some(i) = to_delete {
                         self.create_dialog.columns.remove(i);
@@ -725,6 +730,7 @@ impl eframe::App for App {
             let (title, window_size) = match &popover.mode {
                 PopoverMode::Date(_) => ("Pick Date", [280.0, 60.0]),
                 PopoverMode::Text => ("Edit Cell", [320.0, 240.0]),
+                PopoverMode::Note { .. } => ("Note", [500.0, 400.0]),
             };
 
             egui::Window::new(title)
@@ -756,6 +762,61 @@ impl eframe::App for App {
                                     popover_cancel = true;
                                 }
                             });
+                            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                popover_cancel = true;
+                            }
+                        }
+                        PopoverMode::Note { editing } => {
+                            ui.horizontal(|ui| {
+                                ui.heading("Note");
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if *editing {
+                                        if ui.button("Preview").clicked() {
+                                            *editing = false;
+                                        }
+                                    } else {
+                                        if ui.button("Edit").clicked() {
+                                            *editing = true;
+                                        }
+                                    }
+                                });
+                            });
+                            ui.separator();
+
+                            if *editing {
+                                egui::ScrollArea::vertical().show(ui, |ui| {
+                                    ui.add(
+                                        egui::TextEdit::multiline(&mut popover.buffer)
+                                            .desired_width(f32::INFINITY)
+                                            .desired_rows(10)
+                                            .font(egui::TextStyle::Monospace),
+                                    );
+                                });
+                                ui.separator();
+                                ui.horizontal(|ui| {
+                                    if ui.button("Save").clicked() {
+                                        popover_commit = true;
+                                    }
+                                    if ui.button("Cancel").clicked() {
+                                        popover_cancel = true;
+                                    }
+                                    ui.weak("Ctrl+Enter to save");
+                                });
+                                if ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Enter)) {
+                                    popover_commit = true;
+                                }
+                            } else {
+                                // rendered preview
+                                egui::ScrollArea::vertical().show(ui, |ui| {
+                                    easy_mark::easy_mark(ui, &popover.buffer);
+                                });
+                                ui.separator();
+                                ui.horizontal(|ui| {
+                                    if ui.button("Close").clicked() {
+                                        popover_cancel = true;
+                                    }
+                                });
+                            }
                             if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                                 popover_cancel = true;
                             }
@@ -880,7 +941,7 @@ impl eframe::App for App {
             }
 
             // Clone everything needed before any mutable borrows
-            let (table_name, columns, rows, error, editing_cell, new_row, new_row_error, sort_col, sort_dir, date_columns, foreign_keys, highlighted_row) =
+            let (table_name, columns, rows, error, editing_cell, new_row, new_row_error, sort_col, sort_dir, date_columns, note_columns, foreign_keys, highlighted_row) =
                 match &self.table_view {
                     None => return,
                     Some(v) => (
@@ -894,6 +955,7 @@ impl eframe::App for App {
                         v.sort_col,
                         v.sort_dir.clone(),
                         v.date_columns.clone(),
+                        v.note_columns.clone(),
                         v.foreign_keys.clone(),
                         v.highlighted_row,
                     ),
@@ -908,7 +970,7 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 ui.heading(&table_name);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("⟳ Refresh").clicked() {
+                    if ui.button("↺ Refresh").clicked() {
                         if let Some(conn) = &self.conn {
                             if let Some(view) = &mut self.table_view {
                                 view.reload_rows(conn);
@@ -1033,7 +1095,18 @@ impl eframe::App for App {
                                         let is_fk = foreign_keys.iter().find(|fk| fk.col_idx == col_idx);
                                         let is_highlighted = highlighted_row == Some(row_idx);
 
-                                        let display = if is_long {
+                                        let is_note = note_columns.contains(&col_idx);
+                                        let display = if is_note {
+                                            // show first line only with a note icon
+                                            let first_line = cell.lines().next().unwrap_or("").trim();
+                                            if first_line.is_empty() {
+                                                " Empty note".to_string()
+                                            } else if first_line.len() > 50 {
+                                                format!(" {}…", &first_line[..50])
+                                            } else {
+                                                format!(" {}", first_line)
+                                            }
+                                        } else if is_long {
                                             format!("{}…", &cell[..60])
                                         } else {
                                             cell.clone()
@@ -1070,7 +1143,17 @@ impl eframe::App for App {
 
                                         if double_clicked {
                                             let is_date = date_columns.contains(&col_idx);
-                                            if is_date {
+                                            let is_note = note_columns.contains(&col_idx);
+                                            if is_note {
+                                                new_popover = Some(CellPopover {
+                                                    open: true,
+                                                    row_idx,
+                                                    col_idx,
+                                                    buffer: cell.clone(),
+                                                    pos: rect_min,
+                                                    mode: PopoverMode::Note { editing: false },
+                                                });
+                                            } else if is_date {
                                                 let parsed = chrono::NaiveDate::parse_from_str(cell, "%Y-%m-%d")
                                                     .unwrap_or_else(|_| chrono::Local::now().date_naive());
                                                 new_popover = Some(CellPopover {
