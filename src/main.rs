@@ -100,9 +100,14 @@ impl CreateTableDialog {
         if self.table_name.trim().is_empty() {
             return Err("Table name is required.".to_string());
         }
-        let col_defs: Vec<String> = self
+
+        // First col is always the locked autoincrement id
+        let mut col_defs = vec!["id INTEGER PRIMARY KEY AUTOINCREMENT".to_string()];
+
+        let rest: Vec<String> = self
             .columns
             .iter()
+            .skip(1) // skip the locked id row
             .filter(|c| !c.name.trim().is_empty())
             .map(|c| {
                 let mut def = format!("{} {}", c.name.trim(), c.col_type.label());
@@ -116,9 +121,7 @@ impl CreateTableDialog {
             })
             .collect();
 
-        if col_defs.is_empty() {
-            return Err("At least one column is required.".to_string());
-        }
+        col_defs.extend(rest);
 
         Ok(format!(
             "CREATE TABLE {} ({})",
@@ -140,6 +143,12 @@ struct CellPopover {
 
 // ── Table view (loaded data + edit state) ────────────────────────────────────
 
+#[derive(Clone, PartialEq)]
+enum SortDir {
+    Asc,
+    Desc,
+}
+
 struct TableView {
     table_name: String,
     columns: Vec<String>,
@@ -149,6 +158,8 @@ struct TableView {
     edit_buffer: String,
     new_row: Vec<String>,
     new_row_error: Option<String>,
+    sort_col: Option<usize>,
+    sort_dir: SortDir,
 }
 
 impl TableView {
@@ -162,6 +173,8 @@ impl TableView {
             edit_buffer: String::new(),
             new_row: vec![],
             new_row_error: None,
+            sort_col: None,
+            sort_dir: SortDir::Asc,
         };
 
         match conn.prepare(&format!("PRAGMA table_info({})", table_name)) {
@@ -217,6 +230,27 @@ impl TableView {
             }
         }
     }
+
+    fn apply_sort(&mut self) {
+        if let Some(col) = self.sort_col {
+            let dir = self.sort_dir.clone();
+            self.rows.sort_by(|a, b| {
+                let av = a.get(col).map(|s| s.as_str()).unwrap_or("");
+                let bv = b.get(col).map(|s| s.as_str()).unwrap_or("");
+                // try numeric sort first
+                match (av.parse::<f64>(), bv.parse::<f64>()) {
+                    (Ok(an), Ok(bn)) => {
+                        let ord = an.partial_cmp(&bn).unwrap_or(std::cmp::Ordering::Equal);
+                        if dir == SortDir::Asc { ord } else { ord.reverse() }
+                    }
+                    _ => {
+                        let ord = av.cmp(bv);
+                        if dir == SortDir::Asc { ord } else { ord.reverse() }
+                    }
+                }
+            });
+        }
+    }
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -268,7 +302,7 @@ impl App {
         self.tables.clear();
         if let Some(conn) = &self.conn {
             let mut stmt = conn
-                .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+                .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
                 .unwrap();
             self.tables = stmt
                 .query_map([], |row| row.get(0))
@@ -513,30 +547,45 @@ impl eframe::App for App {
                     ui.separator();
                     let mut to_delete: Option<usize> = None;
                     for (i, col) in self.create_dialog.columns.iter_mut().enumerate() {
+                        let is_id = i == 0;
                         ui.horizontal(|ui| {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut col.name).desired_width(140.0),
-                            );
-                            egui::ComboBox::from_id_salt(format!("col_type_{i}"))
-                                .selected_text(col.col_type.label())
-                                .width(90.0)
-                                .show_ui(ui, |ui| {
-                                    for t in ColType::all() {
-                                        ui.selectable_value(
-                                            &mut col.col_type,
-                                            t.clone(),
-                                            t.label(),
-                                        );
-                                    }
-                                });
-                            ui.checkbox(&mut col.primary_key, "");
-                            ui.add_space(16.0);
-                            ui.checkbox(&mut col.not_null, "");
-                            ui.add_space(16.0);
-                            if ui.small_button("✕").clicked() {
-                                to_delete = Some(i);
+                            if is_id {
+                                ui.add_enabled(
+                                    false,
+                                    egui::TextEdit::singleline(&mut col.name).desired_width(140.0),
+                                );
+                                ui.add_enabled(
+                                    false,
+                                    egui::Button::new("INTEGER  •  AUTOINCREMENT  •  PK"),
+                                );
+                            } else {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut col.name).desired_width(140.0),
+                                );
+                                egui::ComboBox::from_id_salt(format!("col_type_{i}"))
+                                    .selected_text(col.col_type.label())
+                                    .width(90.0)
+                                    .show_ui(ui, |ui| {
+                                        for t in ColType::all() {
+                                            ui.selectable_value(
+                                                &mut col.col_type,
+                                                t.clone(),
+                                                t.label(),
+                                            );
+                                        }
+                                    });
+                                ui.checkbox(&mut col.primary_key, "");
+                                ui.add_space(16.0);
+                                ui.checkbox(&mut col.not_null, "");
+                                ui.add_space(16.0);
+                                if ui.small_button("✕").clicked() {
+                                    to_delete = Some(i);
+                                }
                             }
                         });
+                    }
+                    if let Some(i) = to_delete {
+                        self.create_dialog.columns.remove(i);
                     }
                     if let Some(i) = to_delete {
                         self.create_dialog.columns.remove(i);
@@ -574,16 +623,21 @@ impl eframe::App for App {
             let mut win_open = popover.open;
             egui::Window::new("Edit Cell")
                 .open(&mut win_open)
-                .fixed_pos(popover.pos)
-                .fixed_size([320.0, 160.0])
+                .default_pos(popover.pos)  // moveable — default_pos not fixed_pos
+                .default_size([320.0, 240.0])
+                .min_size([200.0, 120.0])
                 .collapsible(false)
-                .resizable(false)
+                .resizable(true)
                 .show(ctx, |ui| {
-                    ui.add(
-                        egui::TextEdit::multiline(&mut popover.buffer)
-                            .desired_width(f32::INFINITY)
-                            .desired_rows(5),
-                    );
+                    egui::ScrollArea::vertical()
+                        .max_height(160.0)
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::TextEdit::multiline(&mut popover.buffer)
+                                    .desired_width(f32::INFINITY)
+                                    .desired_rows(6),
+                            );
+                        });
                     ui.separator();
                     ui.horizontal(|ui| {
                         if ui.button("Save").clicked() {
@@ -592,7 +646,7 @@ impl eframe::App for App {
                         if ui.button("Cancel").clicked() {
                             popover_cancel = true;
                         }
-                        ui.weak("Ctrl+Enter to save  •  Esc to cancel");
+                        ui.weak("Ctrl+Enter  •  Esc to cancel");
                     });
                     if ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Enter)) {
                         popover_commit = true;
@@ -601,7 +655,6 @@ impl eframe::App for App {
                         popover_cancel = true;
                     }
                 });
-            // user clicked the window's X button
             if !win_open {
                 popover_cancel = true;
             }
@@ -694,7 +747,7 @@ impl eframe::App for App {
             }
 
             // Clone everything needed before any mutable borrows
-            let (table_name, columns, rows, error, editing_cell, new_row, new_row_error) =
+            let (table_name, columns, rows, error, editing_cell, new_row, new_row_error, sort_col, sort_dir) =
                 match &self.table_view {
                     None => return,
                     Some(v) => (
@@ -705,6 +758,8 @@ impl eframe::App for App {
                         v.editing_cell,
                         v.new_row.clone(),
                         v.new_row_error.clone(),
+                        v.sort_col,
+                        v.sort_dir.clone(),
                     ),
                 };
 
@@ -735,7 +790,8 @@ impl eframe::App for App {
             let mut new_edit_buffer: Option<String> = None;
             let mut do_commit_insert = false;
             let mut new_row_updates: Vec<(usize, String)> = vec![];
-            let mut new_popover: Option<CellPopover> = None; // ← declared here
+            let mut new_popover: Option<CellPopover> = None;
+            let mut sort_click: Option<usize> = None;
 
             egui::ScrollArea::both().show(ui, |ui| {
                 TableBuilder::new(ui)
@@ -748,9 +804,18 @@ impl eframe::App for App {
                         header.col(|ui| {
                             ui.weak("#");
                         });
-                        for col_name in &columns {
+                        for (col_idx, col_name) in columns.iter().enumerate() {
                             header.col(|ui| {
-                                ui.strong(col_name);
+                                let arrow = match sort_col {
+                                    Some(i) if i == col_idx => {
+                                        if sort_dir == SortDir::Asc { " ▲" } else { " ▼" }
+                                    }
+                                    _ => "",
+                                };
+                                let label = format!("{}{}", col_name, arrow);
+                                if ui.button(egui::RichText::new(label).strong()).clicked() {
+                                    sort_click = Some(col_idx);
+                                }
                             });
                         }
                     })
@@ -905,6 +970,23 @@ impl eframe::App for App {
             // Apply new popover last so it doesn't clobber an open one mid-edit
             if let Some(p) = new_popover {
                 self.cell_popover = Some(p);
+            }
+
+            if let Some(col_idx) = sort_click {
+                if let Some(view) = &mut self.table_view {
+                    if view.sort_col == Some(col_idx) {
+                        // same column — flip direction
+                        view.sort_dir = if view.sort_dir == SortDir::Asc {
+                            SortDir::Desc
+                        } else {
+                            SortDir::Asc
+                        };
+                    } else {
+                        view.sort_col = Some(col_idx);
+                        view.sort_dir = SortDir::Asc;
+                    }
+                    view.apply_sort();
+                }
             }
         });
     }
