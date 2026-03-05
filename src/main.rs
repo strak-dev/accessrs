@@ -731,7 +731,8 @@ impl eframe::App for App {
                 .open(&mut win_open)
                 .default_pos(popover.pos)
                 .default_size(window_size)
-                .min_size([200.0, 60.0])
+                .min_size([200.0, 120.0])
+                .max_size([800.0, 600.0])
                 .collapsible(false)
                 .resizable(true)
                 .show(ctx, |ui| {
@@ -761,7 +762,6 @@ impl eframe::App for App {
                         }
                         PopoverMode::Text => {
                             egui::ScrollArea::vertical()
-                                .max_height(160.0)
                                 .show(ui, |ui| {
                                     ui.add(
                                         egui::TextEdit::multiline(&mut popover.buffer)
