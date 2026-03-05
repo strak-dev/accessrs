@@ -7,6 +7,7 @@ mod easy_mark;
 use db::schema::SortDir;
 use db::table_view::TableView;
 use ui::create_dialog::CreateTableDialog;
+use ui::popover::{CellPopover, PopoverMode};
 
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
@@ -41,23 +42,6 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(App::default()))
         }),
     )
-}
-
-// ── Cell popover ──────────────────────────────────────────────────────────────
-
-enum PopoverMode {
-    Text,
-    Date(chrono::NaiveDate),
-    Note { editing: bool },
-}
-
-struct CellPopover {
-    open: bool,
-    row_idx: usize,
-    col_idx: usize,
-    buffer: String,        // used for text mode and final committed value
-    pos: egui::Pos2,
-    mode: PopoverMode,
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -337,142 +321,12 @@ impl eframe::App for App {
         }
 
         // ── Cell popover editor ───────────────────────────────────────────────
-        // Rendered at the top level so it floats over the table cleanly.
-        let mut popover_commit = false;
-        let mut popover_cancel = false;
-
-        if let Some(popover) = &mut self.cell_popover {
-            let mut win_open = popover.open;
-
-            let (title, window_size) = match &popover.mode {
-                PopoverMode::Date(_) => ("Pick Date", [280.0, 60.0]),
-                PopoverMode::Text => ("Edit Cell", [320.0, 240.0]),
-                PopoverMode::Note { .. } => ("Note", [500.0, 400.0]),
-            };
-
-            egui::Window::new(title)
-                .open(&mut win_open)
-                .default_pos(popover.pos)
-                .default_size(window_size)
-                .min_size([200.0, 120.0])
-                .max_size([800.0, 600.0])
-                .collapsible(false)
-                .resizable(true)
-                .show(ctx, |ui| {
-                    match &mut popover.mode {
-                        PopoverMode::Date(date) => {
-                            ui.horizontal(|ui| {
-                                ui.label("Date:");
-                                ui.add(
-                                    egui_extras::DatePickerButton::new(date)
-                                        .id_salt("cell_date_picker"),
-                                );
-                            });
-                            ui.add_space(4.0);
-                            ui.separator();
-                            ui.horizontal(|ui| {
-                                if ui.button("Save").clicked() {
-                                    popover.buffer = date.format("%Y-%m-%d").to_string();
-                                    popover_commit = true;
-                                }
-                                if ui.button("Cancel").clicked() {
-                                    popover_cancel = true;
-                                }
-                            });
-                            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                                popover_cancel = true;
-                            }
-                        }
-                        PopoverMode::Note { editing } => {
-                            ui.horizontal(|ui| {
-                                ui.heading("Note");
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if *editing {
-                                        if ui.button("Preview").clicked() {
-                                            *editing = false;
-                                        }
-                                    } else {
-                                        if ui.button("Edit").clicked() {
-                                            *editing = true;
-                                        }
-                                    }
-                                });
-                            });
-                            ui.separator();
-
-                            if *editing {
-                                egui::ScrollArea::vertical().show(ui, |ui| {
-                                    ui.add(
-                                        egui::TextEdit::multiline(&mut popover.buffer)
-                                            .desired_width(f32::INFINITY)
-                                            .desired_rows(10)
-                                            .font(egui::TextStyle::Monospace),
-                                    );
-                                });
-                                ui.separator();
-                                ui.horizontal(|ui| {
-                                    if ui.button("Save").clicked() {
-                                        popover_commit = true;
-                                    }
-                                    if ui.button("Cancel").clicked() {
-                                        popover_cancel = true;
-                                    }
-                                    ui.weak("Ctrl+Enter to save");
-                                });
-                                if ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Enter)) {
-                                    popover_commit = true;
-                                }
-                            } else {
-                                // rendered preview
-                                egui::ScrollArea::vertical().show(ui, |ui| {
-                                    easy_mark::easy_mark(ui, &popover.buffer);
-                                });
-                                ui.separator();
-                                ui.horizontal(|ui| {
-                                    if ui.button("Close").clicked() {
-                                        popover_cancel = true;
-                                    }
-                                });
-                            }
-                            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                                popover_cancel = true;
-                            }
-                        }
-                        PopoverMode::Text => {
-                            egui::ScrollArea::vertical()
-                                .show(ui, |ui| {
-                                    ui.add(
-                                        egui::TextEdit::multiline(&mut popover.buffer)
-                                            .desired_width(f32::INFINITY)
-                                            .desired_rows(6),
-                                    );
-                                });
-                            ui.separator();
-                            ui.horizontal(|ui| {
-                                if ui.button("Save").clicked() {
-                                    popover_commit = true;
-                                }
-                                if ui.button("Cancel").clicked() {
-                                    popover_cancel = true;
-                                }
-                                ui.weak("Ctrl+Enter  •  Esc to cancel");
-                            });
-                            if ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Enter)) {
-                                popover_commit = true;
-                            }
-                            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                                popover_cancel = true;
-                            }
-                        }
-                    }
-                });
-            if !win_open {
-                popover_cancel = true;
-            }
-        }
+        let (popover_commit, popover_cancel) = match &mut self.cell_popover {
+            Some(popover) => popover.show(ctx),
+            None => (false, false),
+        };
 
         if popover_commit {
-            // Inject into table_view edit state then reuse commit_edit()
             if let Some(popover) = &self.cell_popover {
                 if let Some(view) = &mut self.table_view {
                     view.editing_cell = Some((popover.row_idx, popover.col_idx));
