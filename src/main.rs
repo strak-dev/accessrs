@@ -1,10 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod db;
+mod easy_mark;
+
+use db::schema::{ColumnDef, ColType, ForeignKeyInfo, SortDir};
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 use rfd::FileDialog;
 use rusqlite::Connection;
-mod easy_mark;
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
@@ -34,66 +37,6 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(App::default()))
         }),
     )
-}
-
-// ── Column / table-creation types ────────────────────────────────────────────
-
-#[derive(Clone)]
-struct ColumnDef {
-    name: String,
-    col_type: ColType,
-    primary_key: bool,
-    not_null: bool,
-}
-
-#[derive(Clone, PartialEq)]
-enum ColType {
-    Text,
-    Integer,
-    Real,
-    Blob,
-    Date,
-    ForeignKey(String),
-    Note,
-}
-
-impl ColType {
-    fn label(&self) -> &str {
-        match self {
-            ColType::Text => "TEXT",
-            ColType::Integer => "INTEGER",
-            ColType::Real => "REAL",
-            ColType::Blob => "BLOB",
-            ColType::Date => "DATE",
-            ColType::ForeignKey(_) => "FK",
-            ColType::Note => "NOTE",
-        }
-    }
-    fn sql_type(&self) -> &str {
-        match self {
-            ColType::Text => "TEXT",
-            ColType::Integer => "INTEGER",
-            ColType::Real => "REAL",
-            ColType::Blob => "BLOB",
-            ColType::Date => "DATE",
-            ColType::ForeignKey(_) => "INTEGER",
-            ColType::Note => "NOTE", // stored as TEXT, detectable via PRAGMA
-        }
-    }
-    fn base_types() -> &'static [ColType] {
-        &[ColType::Text, ColType::Integer, ColType::Real, ColType::Blob, ColType::Date, ColType::Note]
-    }
-}
-
-impl Default for ColumnDef {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            col_type: ColType::Text,
-            primary_key: false,
-            not_null: false,
-        }
-    }
 }
 
 // ── Create-table dialog ───────────────────────────────────────────────────────
@@ -185,19 +128,6 @@ struct CellPopover {
 }
 
 // ── Table view (loaded data + edit state) ────────────────────────────────────
-
-#[derive(Clone, PartialEq)]
-enum SortDir {
-    Asc,
-    Desc,
-}
-
-#[derive(Clone)]
-struct ForeignKeyInfo {
-    col_idx: usize,
-    ref_table: String,
-    ref_col: String,
-}
 
 struct TableView {
     table_name: String,
