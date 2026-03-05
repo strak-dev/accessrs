@@ -230,7 +230,6 @@ struct App {
     create_dialog: CreateTableDialog,
     cell_popover: Option<CellPopover>,
     table_view: Option<TableView>,
-    row_height: f32,
 }
 
 impl Default for App {
@@ -244,7 +243,6 @@ impl Default for App {
             create_dialog: CreateTableDialog::default(),
             cell_popover: None,
             table_view: None,
-            row_height: 24.0,
         }
     }
 }
@@ -726,9 +724,6 @@ impl eframe::App for App {
                             }
                         }
                     }
-                    ui.separator();
-                    ui.label("Row height:");
-                    ui.add(egui::Slider::new(&mut self.row_height, 20.0..=80.0).step_by(4.0));
                 });
             });
             ui.separator();
@@ -761,7 +756,7 @@ impl eframe::App for App {
                     })
                     .body(|body| {
                         let total_rows = rows.len() + 1;
-                        body.rows(self.row_height, total_rows, |mut row| {
+                        body.rows(24.0, total_rows, |mut row| {
                             let row_idx = row.index();
 
                             // ── New-row insert strip ──────────────────────
@@ -839,13 +834,11 @@ impl eframe::App for App {
                                             cell.clone()
                                         };
 
-                                        let response = ui.label(&display);
+                                    let response = ui.label(&display);
+                                    let rect_min = response.rect.min;
+                                    let double_clicked = response.double_clicked();
 
-                                        if is_long {
-                                            response.clone().on_hover_text(cell);
-                                        }
-
-                                        if response.double_clicked() {
+                                    if double_clicked {
                                             if is_long {
                                                 // Long cell → floating multiline popover
                                                 new_popover = Some(CellPopover {
@@ -853,7 +846,7 @@ impl eframe::App for App {
                                                     row_idx,
                                                     col_idx,
                                                     buffer: cell.clone(),
-                                                    pos: response.rect.min,
+                                                    pos: rect_min,
                                                 });
                                             } else {
                                                 // Short cell → inline single-line edit
