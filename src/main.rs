@@ -8,6 +8,7 @@ use db::schema::SortDir;
 use db::table_view::TableView;
 use ui::create_dialog::CreateTableDialog;
 use ui::popover::{CellPopover, PopoverMode};
+use ui::sidebar;
 
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
@@ -341,39 +342,7 @@ impl eframe::App for App {
         }
 
         // Sidebar
-        if self.conn.is_some() {
-            egui::SidePanel::left("table_list")
-                .resizable(true)
-                .default_width(200.0)
-                .show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.heading("Tables");
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button("⟳").clicked() {
-                                self.refresh_tables();
-                            }
-                            if ui.small_button("+").clicked() {
-                                self.create_dialog.open = true;
-                            }
-                        });
-                    });
-                    ui.separator();
-                    if self.tables.is_empty() {
-                        ui.label("No tables yet.");
-                    } else {
-                        egui::ScrollArea::vertical().show(ui, |ui| {
-                            let tables = self.tables.clone();
-                            for table in &tables {
-                                let selected =
-                                    self.selected_table.as_deref() == Some(table.as_str());
-                                if ui.selectable_label(selected, table).clicked() {
-                                    self.select_table(table);
-                                }
-                            }
-                        });
-                    }
-                });
-        }
+        sidebar::show(self, ctx);
 
         // Main panel
         egui::CentralPanel::default().show(ctx, |ui| {
