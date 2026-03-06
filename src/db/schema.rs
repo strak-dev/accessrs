@@ -40,7 +40,7 @@ impl ColType {
             ColType::Date => "DATE",
             ColType::ForeignKey(_) => "INTEGER",
             ColType::Note => "NOTE",
-            ColType::Boolean => "INTEGER"
+            ColType::Boolean => "BOOLEAN"
         }
     }
     pub fn base_types() -> &'static [ColType] {

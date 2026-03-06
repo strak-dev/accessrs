@@ -57,7 +57,10 @@ pub fn show(app: &App, ui: &mut egui::Ui, actions: &mut GridActions) {
             .resizable(true)
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
             .column(Column::exact(36.0))
-            .columns(Column::auto().resizable(true).clip(true), columns.len())
+            .columns(
+                Column::initial(120.0).at_least(40.0).resizable(true).clip(true),
+                columns.len()
+            )
             .header(24.0, |mut header| {
                 header.col(|ui| {
                     ui.weak("#");
